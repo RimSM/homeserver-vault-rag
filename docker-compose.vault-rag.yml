@@ -4,10 +4,9 @@
 # 실행: docker network create home-server-network  (없으면, infra와 공유)
 #       cp .env.example .env  후 채우고 docker compose -f docker-compose.vault-rag.yml up -d --build
 #
-# PGHOST/OLLAMA_URL 은 .env 값을 그대로 씀(현재: 맥미니 Tailscale IP) — stage/prod 어디서
-# 실행하든 이미 검증된 경로라 컨테이너 안에서도 그대로 도달함. (컨테이너를 postgres/ollama와
-# 같은 home-server-network 서비스명으로 직접 붙이려면 stage는 Ollama가 host native라 안 맞음 —
-# 그래서 여기선 external network 연결은 참여만 하고 주소는 .env 그대로 둠.)
+# PGHOST/OLLAMA_URL 은 컨테이너 안에서 host.docker.internal 로 오버라이드됨
+# (docker-entrypoint.sh 참고) — 호스트 .env 의 값(맨몸 CLI 기준: localhost 또는
+# stage의 Tailscale IP)은 컨테이너 관점에선 안 맞아서 그대로 못 씀.
 
 name: vault-rag
 
@@ -16,10 +15,13 @@ services:
     build: .
     container_name: vault-rag-serve
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # Docker Desktop(Mac)엔 원래 기본 제공이지만 명시해 안전하게
     volumes:
       # embed.py가 os.environ이 아니라 /app/.env 파일 자체를 직접 파싱함(load_env) →
       # env_file: 로 프로세스 환경변수만 주입하면 못 찾고 기동 거부. 파일째 마운트.
-      - ./.env:/app/.env:ro
+      # .env.host로 마운트하고 entrypoint가 PGHOST/OLLAMA_URL만 오버라이드해 /app/.env로 복사.
+      - ./.env:/app/.env.host:ro
     ports:
       - "127.0.0.1:8787:8787"   # host 쪽도 loopback만 publish — LAN 노출 0 (기존 바인드 요구사항 계승)
     networks:
