@@ -1,0 +1,31 @@
+# vault-rag HTTP 엔드포인트 (serve.py) — 홈서버 전체 원칙(모든 서비스 = docker compose)과
+# 일치시키기 위해 launchd 대신 컨테이너로 상시 구동. → vault 01_Projects/99_RIMSM/004.vault-rag/overview.md
+#
+# 실행: docker network create home-server-network  (없으면, infra와 공유)
+#       cp .env.example .env  후 채우고 docker compose -f docker-compose.vault-rag.yml up -d --build
+#
+# PGHOST/OLLAMA_URL 은 .env 값을 그대로 씀(현재: 맥미니 Tailscale IP) — stage/prod 어디서
+# 실행하든 이미 검증된 경로라 컨테이너 안에서도 그대로 도달함. (컨테이너를 postgres/ollama와
+# 같은 home-server-network 서비스명으로 직접 붙이려면 stage는 Ollama가 host native라 안 맞음 —
+# 그래서 여기선 external network 연결은 참여만 하고 주소는 .env 그대로 둠.)
+
+name: vault-rag
+
+services:
+  serve:
+    build: .
+    container_name: vault-rag-serve
+    restart: unless-stopped
+    volumes:
+      # embed.py가 os.environ이 아니라 /app/.env 파일 자체를 직접 파싱함(load_env) →
+      # env_file: 로 프로세스 환경변수만 주입하면 못 찾고 기동 거부. 파일째 마운트.
+      - ./.env:/app/.env:ro
+    ports:
+      - "127.0.0.1:8787:8787"   # host 쪽도 loopback만 publish — LAN 노출 0 (기존 바인드 요구사항 계승)
+    networks:
+      - home-server-network
+    mem_limit: 256m
+
+networks:
+  home-server-network:
+    external: true

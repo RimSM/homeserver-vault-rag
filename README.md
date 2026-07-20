@@ -52,10 +52,18 @@ python src/chunk.py --json > chunks.json
 막히지만** 평범한 공개 HTTPS 는 통과 → RAG 질의 경로를 HTTP 하나로 통일.
 (Tailscale/SSH 는 RAG 용에서 빠지고 맥미니 관리·배포용으로만 존속. 상세 → vault overview.md)
 
-추가 의존성 없음 — 표준 라이브러리 `http.server`.
+추가 의존성 없음 — 표준 라이브러리 `http.server`. **상시 구동은 홈서버 전체 원칙(서비스=docker
+compose)과 맞춰 컨테이너로.** (다른 모든 서비스와 격리 방식 통일 — 맨몸 launchd 프로세스 아님.)
 
 ```bash
 # .env 에 RAG_SECRET 채운 뒤 (미설정이면 기동 거부 = fail-closed)
+
+# 컨테이너로 상시 구동 (권장 — home-server-network 필요: docker network create home-server-network)
+docker compose -f docker-compose.vault-rag.yml up -d --build
+# host 쪽도 127.0.0.1만 publish(docker-compose.vault-rag.yml) — LAN 노출 0, 기존 바인드 요구사항 그대로 유지.
+# .env는 컨테이너에 통째로 bind mount(embed.py가 os.environ이 아니라 .env 파일을 직접 읽으므로).
+
+# 로컬 디버깅용 (컨테이너 없이 직접)
 ./.venv/bin/python src/serve.py            # 127.0.0.1:8787 고정 바인드
 
 # POST — 질의가 body 라 인코딩 함정 없음 (훅 권장 경로)
@@ -85,4 +93,6 @@ curl --max-time 15 --get "https://rag.rimsm.com/query" \
 - [ ] 검색 품질 튜닝 (청킹 단위, seed-k / max-neighbors / top-k)
 - [x] HTTP 엔드포인트 (`src/serve.py`) — SSH → curl 전환용
 - [ ] Cloudflare Tunnel ingress `rag.rimsm.com` + Access 서비스 토큰 (대시보드 작업)
-- [ ] 맥미니 상시 구동 (launchd) + 훅 2개(`.sh`/`.ps1`)를 curl 로 교체
+- [x] 맥미니 상시 구동 = docker compose (`Dockerfile` + `docker-compose.vault-rag.yml`, 2026-07-20 — 홈서버 전체 원칙과 통일, launchd 계획 폐기)
+- [ ] 맥미니에서 실제 `docker compose up -d` 배포 (지금은 stage 맥북에서만 검증)
+- [ ] 훅 2개(`.sh`/`.ps1`)를 curl 로 교체
