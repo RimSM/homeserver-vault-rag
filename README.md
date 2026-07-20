@@ -13,8 +13,8 @@
 ```
 [인덱싱] 노트 → 청킹(헤더 섹션) → bge-m3 임베딩 → Postgres(pgvector) 적재
                               + 위키링크 resolve → links 테이블
-[질의]  질문 → bge-m3 임베딩 → 벡터 top-k(씨앗) → links 1-hop 확장(이웃 청크 추가)
-             → 쿼리 코사인 재정렬 → 상위 N개 "노트/섹션" 반환
+[질의]  질문 → bge-m3 임베딩 → 벡터 씨앗(seed_k 청크→노트) → links 1-hop 확장(이웃 노트)
+             → 노트 union(best-chunk 코사인 정렬 + 이웃 슬롯 예약) → 상위 노트 목록 반환
 ```
 
 **생성(LLM) 단계는 없음.** RAG는 "어느 노트/섹션(source_path + heading_trail)"만 반환하고,
@@ -33,9 +33,11 @@ cp .env.example .env    # PGPASSWORD 등 채우기 (.env 는 git 제외)
 # 특정 파일만 증분 인덱싱
 ./.venv/bin/python src/embed.py --file "01_Projects/.../note.md"
 
-# 검색 (사람용 / Claude용 JSON)
-./.venv/bin/python src/embed.py --query "질문" --top-k 5
+# 검색 (사람용 / Claude용 JSON) — 기본: 노트 union + 이웃 슬롯 예약
+./.venv/bin/python src/embed.py --query "질문"
 ./.venv/bin/python src/embed.py --query "질문" --json
+# 파라미터 조절 (기본 seed_k=10 / max-neighbors=10 / max-notes=10 / neighbor-reserve=3)
+./.venv/bin/python src/embed.py --query "질문" --max-notes 12 --neighbor-reserve 4
 ```
 
 ### 청킹 단독 (표준 라이브러리만, pip 없이)
@@ -46,7 +48,7 @@ python src/chunk.py --json > chunks.json
 
 ## 다음
 - [x] 임베딩 → Postgres(pgvector) 적재 (`src/embed.py`)
-- [x] 질의 파이프라인 (벡터검색 + links 1-hop resolve + rerank)
+- [x] 질의 파이프라인 (벡터검색 + links 1-hop resolve + 노트 union/이웃예약)
 - [x] bge-m3 전환 (한국어 검색 품질) + 배치 재인덱싱
 - [ ] incremental 재인덱싱 자동화 (`git diff --name-only` 기반)
 - [ ] n8n 트리거 (맥미니 git pull 감지 → 변경 노트만 재인덱싱)

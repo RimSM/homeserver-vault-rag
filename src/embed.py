@@ -2,8 +2,8 @@
 vault-rag Phase 1 — 임베딩 · 적재 · 검색 (bge-m3 + pgvector)
 
 설계(→ vault 01_Projects/99_RIMSM/004.vault-rag/overview.md):
-  질의 → [이 서비스: bge-m3 임베딩 → 벡터 top-k → 링크 resolve → 1-hop 확장 → rerank]
-       → "어느 노트/섹션(source_path + heading_trail)"만 반환
+  질의 → [이 서비스: bge-m3 임베딩 → 벡터 씨앗 → 링크 resolve → 1-hop 확장 → 노트 union]
+       → "어느 노트(source_path + best-chunk heading_trail)"만 반환
   → 생성은 Claude Code(나)가 그 경로의 로컬 vault .md 를 Read 해서 종합. (LLM 생성 단계 없음)
 
 핵심 리팩토링 (2026-07-18):
@@ -12,11 +12,17 @@ vault-rag Phase 1 — 임베딩 · 적재 · 검색 (bge-m3 + pgvector)
   - 진짜 1-hop 확장 + rerank: 벡터 top-k 노트의 링크 이웃 청크를 후보에 추가 후 쿼리 코사인 재정렬.
   - index_all: 배치(기본 100개) commit + 진행 카운트 체킹.
 
+검색 리팩토링 (2026-07-20):
+  - 청크 top-k 칼질 폐기 → **노트 단위 union 반환**. 옛 방식은 seed_k(10)≥top_k(5)면 이웃이
+    씨앗을 쿼리-코사인으로 못 이겨 최종 진입 불가(증명된 no-op)였음. search() docstring 참고.
+  - **이웃 슬롯 예약(neighbor_reserve)**: 이웃에게 최소 슬롯 보장(floor) → 1-hop이 실제로 살아남음.
+  - 기본값: seed_k=10, max_neighbors=10, max_notes=10, neighbor_reserve=3. 노트 점수=best-chunk 코사인.
+
 사용:
     python src/embed.py --all                     # 전체 재인덱싱 (테이블 리셋 후 배치 적재)
     python src/embed.py --file "path/to/note.md"  # 특정 파일 증분 인덱싱
-    python src/embed.py --query "질문" --top-k 5   # 검색 (사람용 출력)
-    python src/embed.py --query "질문" --json      # 검색 (Claude가 먹기 좋은 JSON)
+    python src/embed.py --query "질문" --json      # 검색 (Claude가 먹기 좋은 JSON, 기본 노트 union)
+    python src/embed.py --query "질문" --max-notes 10 --neighbor-reserve 3   # 상한/이웃예약 조절
 """
 from __future__ import annotations
 
@@ -279,21 +285,34 @@ def index_file(conn, rel_path: str):
     print(f"[*] {rel_path} 증분 완료.")
 
 
-# ---------------------------------------------------------------- 검색 (top-k → 1-hop → rerank)
-def search(conn, query: str, top_k: int, seed_k: int, max_neighbors: int):
+# ---------------------------------------------------------------- 검색 (씨앗 → 1-hop → 노트 union + 이웃 예약)
+def search(conn, query: str, seed_k: int, max_neighbors: int,
+           max_notes: int, neighbor_reserve: int):
+    """벡터 씨앗 → 1-hop 이웃 → **노트 단위 union** 반환 (청크 top-k 칼질 폐기).
+
+    설계 배경 (→ vault search-pipeline.md 2026-07-20):
+      옛 방식은 씨앗+이웃 청크를 *같은 쿼리-코사인*으로 재정렬해 top_k를 잘랐음.
+      seed_k(10) ≥ top_k(5)면 이웃은 씨앗을 코사인으로 못 이겨 **최종에 절대 진입 못 함**
+      (증명된 no-op). 반환값이 노트 경로뿐이고 실제 읽기는 Claude Code가 로컬 전문을
+      Read 하므로, 청크 top-k로 좁힐 이유가 없음 → 노트 union으로 전환.
+
+    선택 규칙 (이웃 슬롯 예약 = floor):
+      - 노트 점수 = 그 노트 청크들의 best(최고) 코사인.
+      - 이웃에게 최소 neighbor_reserve칸 보장(있는 만큼). 나머지는 씨앗+잔여이웃을
+        점수순 그리디로 채움 → 총 max_notes까지. 빈칸 낭비 없음(한쪽 부족하면 다른 쪽 흡수).
+    """
     qvec = embed_one(query)
     with conn.cursor() as cur:
-        # ① 벡터 top-k 씨앗
+        # ① 벡터 씨앗: top seed_k 청크 → 씨앗 노트(순서 보존 dedup)
         cur.execute(f"""
-            SELECT id, source_path FROM {SCHEMA}.chunks
+            SELECT source_path FROM {SCHEMA}.chunks
             ORDER BY embedding <=> %s::vector LIMIT %s;
         """, (qvec, seed_k))
-        seeds = cur.fetchall()
-        if not seeds:
+        seed_paths = list(dict.fromkeys(r[0] for r in cur.fetchall()))
+        if not seed_paths:
             return []
-        seed_paths = sorted({r[1] for r in seeds})
 
-        # ② 1-hop 확장: 씨앗 노트의 링크 이웃 (outgoing resolve + incoming)
+        # ② 1-hop 이웃 노트 (outgoing resolve + incoming), 씨앗 제외, 상한
         cur.execute(f"""
             SELECT DISTINCT target_path FROM {SCHEMA}.links
             WHERE source_path = ANY(%s) AND target_path IS NOT NULL
@@ -301,33 +320,53 @@ def search(conn, query: str, top_k: int, seed_k: int, max_neighbors: int):
             SELECT DISTINCT source_path FROM {SCHEMA}.links
             WHERE target_path = ANY(%s)
         """, (seed_paths, seed_paths))
-        neighbor_paths = [r[0] for r in cur.fetchall() if r[0] not in seed_paths][:max_neighbors]
+        seed_set = set(seed_paths)
+        neighbor_paths = [r[0] for r in cur.fetchall() if r[0] not in seed_set][:max_neighbors]
 
-        # ③ 후보 풀(씨앗 노트 + 이웃 노트의 청크) 전체를 쿼리 코사인으로 재정렬 → 상위 top_k
+        # ③ 후보 노트별 대표 청크 = 최고 코사인 청크 + 그 메타 (노트 점수용)
         cand_paths = seed_paths + neighbor_paths
         cur.execute(f"""
-            SELECT source_path, title, heading_trail, heading, text,
-                   (1 - (embedding <=> %s::vector)) AS sim,
-                   (source_path = ANY(%s))  AS is_seed
+            SELECT DISTINCT ON (source_path)
+                   source_path, title, heading_trail, heading, text,
+                   (1 - (embedding <=> %s::vector)) AS sim
             FROM {SCHEMA}.chunks
             WHERE source_path = ANY(%s)
-            ORDER BY embedding <=> %s::vector
-            LIMIT %s;
-        """, (qvec, seed_paths, cand_paths, qvec, top_k))
-        rows = cur.fetchall()
+            ORDER BY source_path, embedding <=> %s::vector;
+        """, (qvec, cand_paths, qvec))
+        best = {r[0]: r for r in cur.fetchall()}   # source_path -> row
 
-    results = []
-    for rank, (sp, title, trail, heading, text, sim, is_seed) in enumerate(rows, 1):
-        snippet = " ".join(text.split())[:220]
-        results.append({
-            "rank": rank,
+    def rec(sp: str, is_seed: bool) -> dict:
+        _, title, trail, heading, text, sim = best[sp]
+        return {
             "source_path": sp,
             "title": title,
             "heading_trail": trail,
             "similarity": round(float(sim), 4),
             "via": "vector" if is_seed else "graph-1hop",
-            "snippet": snippet,
-        })
+            "snippet": " ".join(text.split())[:220],
+            "_score": float(sim),
+        }
+
+    seeds = sorted((rec(p, True) for p in seed_paths if p in best),
+                   key=lambda x: x["_score"], reverse=True)
+    neighs = sorted((rec(p, False) for p in neighbor_paths if p in best),
+                    key=lambda x: x["_score"], reverse=True)
+
+    # ④ 이웃 슬롯 예약(floor) + 낭비 없는 그리디 채움
+    reserve = min(neighbor_reserve, max_notes)
+    guaranteed = neighs[:reserve]                          # 이웃 최소 보장분
+    guaranteed_ids = {r["source_path"] for r in guaranteed}
+    rest_pool = sorted(
+        (r for r in (seeds + neighs) if r["source_path"] not in guaranteed_ids),
+        key=lambda x: x["_score"], reverse=True,
+    )
+    rest = rest_pool[: max(0, max_notes - len(guaranteed))]
+    selected = sorted(guaranteed + rest, key=lambda x: x["_score"], reverse=True)
+
+    results = []
+    for rank, r in enumerate(selected, 1):
+        r.pop("_score", None)
+        results.append({"rank": rank, **r})
     return results
 
 
@@ -352,11 +391,14 @@ def main():
     g.add_argument("--file", type=str, help="특정 파일 증분 인덱싱 (추가/수정)")
     g.add_argument("--delete", type=str, help="특정 파일 삭제 반영 (vault에서 지워지거나 리네임된 노트)")
     g.add_argument("--query", type=str, help="검색")
-    ap.add_argument("--top-k", type=int, default=5, help="최종 반환 청크 수 (rerank 후)")
-    ap.add_argument("--seed-k", type=int, default=10, help="1-hop 전 벡터 씨앗 수")
-    ap.add_argument("--max-neighbors", type=int, default=12, help="1-hop 이웃 노트 상한")
+    ap.add_argument("--seed-k", type=int, default=10, help="벡터 씨앗 청크 수 (넓은 그물=recall)")
+    ap.add_argument("--max-neighbors", type=int, default=10, help="1-hop 이웃 노트 상한")
+    ap.add_argument("--max-notes", type=int, default=10, help="최종 반환 노트 상한 (cap)")
+    ap.add_argument("--neighbor-reserve", type=int, default=3, help="이웃에게 보장할 최소 슬롯 (floor)")
+    ap.add_argument("--top-k", type=int, default=None, help="(별칭) --max-notes 와 동일. 하위호환용")
     ap.add_argument("--json", action="store_true", help="검색 결과를 JSON 으로")
     args = ap.parse_args()
+    max_notes = args.top_k if args.top_k is not None else args.max_notes
 
     try:
         conn = get_db_connection()
@@ -370,7 +412,8 @@ def main():
         elif args.delete:
             delete_file(conn, args.delete)
         elif args.query:
-            res = search(conn, args.query, args.top_k, args.seed_k, args.max_neighbors)
+            res = search(conn, args.query, args.seed_k, args.max_neighbors,
+                         max_notes, args.neighbor_reserve)
             if args.json:
                 print(json.dumps({"query": args.query, "results": res}, ensure_ascii=False, indent=2))
             else:
