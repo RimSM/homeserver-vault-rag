@@ -353,7 +353,9 @@ def search(conn, query: str, seed_k: int, max_neighbors: int,
                     key=lambda x: x["_score"], reverse=True)
 
     # ④ 이웃 슬롯 예약(floor) + 낭비 없는 그리디 채움
-    reserve = min(neighbor_reserve, max_notes)
+    # 예약은 예산의 절반까지만 — 하한(floor)이 씨앗의 상한(ceiling)으로 변질되는 걸 막는 가드레일.
+    # (max_notes 가 작으면 min(reserve, max_notes) 는 예약이 전 슬롯을 먹어 코사인 1위마저 탈락시킴)
+    reserve = min(neighbor_reserve, max_notes // 2)
     guaranteed = neighs[:reserve]                          # 이웃 최소 보장분
     guaranteed_ids = {r["source_path"] for r in guaranteed}
     rest_pool = sorted(
