@@ -46,6 +46,36 @@ python src/chunk.py                 # vault 통계 + 샘플
 python src/chunk.py --json > chunks.json
 ```
 
+## HTTP 엔드포인트 (`src/serve.py`)
+
+훅이 SSH 대신 `curl` 로 부르는 검색 서버. **회사망은 TLS 검열로 Tailscale 이 구조적으로
+막히지만** 평범한 공개 HTTPS 는 통과 → RAG 질의 경로를 HTTP 하나로 통일.
+(Tailscale/SSH 는 RAG 용에서 빠지고 맥미니 관리·배포용으로만 존속. 상세 → vault overview.md)
+
+추가 의존성 없음 — 표준 라이브러리 `http.server`.
+
+```bash
+# .env 에 RAG_SECRET 채운 뒤 (미설정이면 기동 거부 = fail-closed)
+./.venv/bin/python src/serve.py            # 127.0.0.1:8787 고정 바인드
+
+# POST — 질의가 body 라 인코딩 함정 없음 (훅 권장 경로)
+curl --max-time 15 "https://rag.rimsm.com/query" \
+  -H "CF-Access-Client-Id: <서비스토큰 id>" \
+  -H "CF-Access-Client-Secret: <서비스토큰 secret>" \
+  -H "X-RAG-Secret: <RAG_SECRET>" \
+  -H "Content-Type: application/json" -d '{"q":"질문"}'
+
+# GET — 한글은 반드시 percent-encoding (--data-urlencode). 안 하면 400.
+curl --max-time 15 --get "https://rag.rimsm.com/query" \
+  --data-urlencode "q=질문" -H "X-RAG-Secret: <RAG_SECRET>" # + CF 헤더
+```
+
+응답 JSON 은 `embed.py --query --json` 과 **완전히 동일**(훅만 갈아끼우면 됨).
+`GET /health` 는 무인증 `{"ok":true}` — 터널·기동 확인용, vault 정보 일절 없음.
+
+**보안 4겹**: ① Cloudflare Access 서비스 토큰(엣지에서 403) → ② `X-RAG-Secret` 헤더
+→ ③ `127.0.0.1` 고정 바인드(집 LAN 에서도 맨몸 접근 불가) → ④ `RAG_SECRET` 없으면 기동 거부.
+
 ## 다음
 - [x] 임베딩 → Postgres(pgvector) 적재 (`src/embed.py`)
 - [x] 질의 파이프라인 (벡터검색 + links 1-hop resolve + 노트 union/이웃예약)
@@ -53,3 +83,6 @@ python src/chunk.py --json > chunks.json
 - [ ] incremental 재인덱싱 자동화 (`git diff --name-only` 기반)
 - [ ] n8n 트리거 (맥미니 git pull 감지 → 변경 노트만 재인덱싱)
 - [ ] 검색 품질 튜닝 (청킹 단위, seed-k / max-neighbors / top-k)
+- [x] HTTP 엔드포인트 (`src/serve.py`) — SSH → curl 전환용
+- [ ] Cloudflare Tunnel ingress `rag.rimsm.com` + Access 서비스 토큰 (대시보드 작업)
+- [ ] 맥미니 상시 구동 (launchd) + 훅 2개(`.sh`/`.ps1`)를 curl 로 교체
